@@ -348,69 +348,60 @@ func (s *SSMStore) List(service string, includeValues bool) ([]Secret, error) {
 // other meta-data. Uses faster AWS APIs with much higher rate-limits. Suitable for
 // use in production environments.
 func (s *SSMStore) ListRaw(service string) ([]RawSecret, error) {
+
+	secrets := map[string]RawSecret{}
+	var nextToken *string
+	var queryPath *string
 	if s.usePaths {
-		secrets := map[string]RawSecret{}
-		var nextToken *string
-		for {
-			getParametersByPathInput := &ssm.GetParametersByPathInput{
-				MaxResults:     aws.Int64(10),
-				NextToken:      nextToken,
-				Path:           aws.String("/" + service + "/"),
-				WithDecryption: aws.Bool(true),
-			}
-
-			resp, err := s.svc.GetParametersByPath(getParametersByPathInput)
-			if err != nil {
-				return nil, err
-			}
-
-			for _, param := range resp.Parameters {
-				if !s.validateName(*param.Name) {
-					continue
-				}
-
-				secrets[*param.Name] = RawSecret{
-					Value: *param.Value,
-					Key:   *param.Name,
-				}
-			}
-
-			if resp.NextToken == nil {
-				break
-			}
-
-			nextToken = resp.NextToken
-		}
-
-		rawSecrets := make([]RawSecret, len(secrets))
-		i := 0
-		for _, rawSecret := range secrets {
-			rawSecrets[i] = rawSecret
-			i += 1
-		}
-		return rawSecrets, nil
-
+		queryPath = aws.String("/" + service + "/")
 	} else {
-		// Delegate to List
-		secrets, err := s.List(service, true)
+		// Note: AWS doesn't actually allow us to filter by name here, so we just fetch everything
+		queryPath = aws.String("/")
+	}
 
+	for {
+		getParametersByPathInput := &ssm.GetParametersByPathInput{
+			MaxResults:     aws.Int64(10),
+			NextToken:      nextToken,
+			Path:           queryPath,
+			WithDecryption: aws.Bool(true),
+		}
+
+		resp, err := s.svc.GetParametersByPath(getParametersByPathInput)
 		if err != nil {
 			return nil, err
 		}
 
-		rawSecrets := make([]RawSecret, len(secrets))
-		for i, secret := range secrets {
-			rawSecrets[i] = RawSecret{
-				Key: secret.Meta.Key,
+		for _, param := range resp.Parameters {
+			if !s.validateName(*param.Name) {
+				continue
+			}
 
-				// This dereference is safe because we trust List to have given us the values
-				// that we asked-for
-				Value: *secret.Value,
+			// If we're not using paths, then we need to filter parameters by name locally
+			if !s.usePaths && !strings.HasPrefix(*param.Name, service+".") {
+				continue
+			}
+
+			secrets[*param.Name] = RawSecret{
+				Value: *param.Value,
+				Key:   *param.Name,
 			}
 		}
 
-		return rawSecrets, nil
+		if resp.NextToken == nil {
+			break
+		}
+
+		nextToken = resp.NextToken
 	}
+
+	rawSecrets := make([]RawSecret, len(secrets))
+	i := 0
+	for _, rawSecret := range secrets {
+		rawSecrets[i] = rawSecret
+		i += 1
+	}
+	return rawSecrets, nil
 }
 
 // History returns a list of events that have occured regarding the given
