@@ -12,9 +12,11 @@ import (
 
 	"github.com/magiconair/properties"
 	"github.com/pkg/errors"
-	"github.com/segmentio/chamber/store"
 	"github.com/spf13/cobra"
+	analytics "gopkg.in/segmentio/analytics-go.v3"
 )
+
+const doubleQuoteSpecialChars = "\\\n\r\"!$`"
 
 // exportCmd represents the export command
 var (
@@ -30,7 +32,7 @@ var (
 )
 
 func init() {
-	exportCmd.Flags().StringVarP(&exportFormat, "format", "f", "json", "Output format (json, java-properties, csv, tsv, dotenv)")
+	exportCmd.Flags().StringVarP(&exportFormat, "format", "f", "json", "Output format (json, java-properties, csv, tsv, dotenv, tfvars)")
 	exportCmd.Flags().StringVarP(&exportOutput, "output-file", "o", "", "Output file (default is standard output)")
 	RootCmd.AddCommand(exportCmd)
 }
@@ -38,7 +40,22 @@ func init() {
 func runExport(cmd *cobra.Command, args []string) error {
 	var err error
 
-	secretStore := store.NewSSMStore(numRetries)
+	if analyticsEnabled && analyticsClient != nil {
+		analyticsClient.Enqueue(analytics.Track{
+			UserId: username,
+			Event:  "Ran Command",
+			Properties: analytics.NewProperties().
+				Set("command", "export").
+				Set("chamber-version", chamberVersion).
+				Set("services", args).
+				Set("backend", backend),
+		})
+	}
+
+	secretStore, err := getSecretStore()
+	if err != nil {
+		return err
+	}
 	params := make(map[string]string)
 	for _, service := range args {
 		if err := validateService(service); err != nil {
@@ -52,7 +69,7 @@ func runExport(cmd *cobra.Command, args []string) error {
 		for _, rawSecret := range rawSecrets {
 			k := key(rawSecret.Key)
 			if _, ok := params[k]; ok {
-				fmt.Fprintf(os.Stderr, "warning: parameter %s specified more than once (overriden by service %s)\n", k, service)
+				fmt.Fprintf(os.Stderr, "warning: parameter %s specified more than once (overridden by service %s)\n", k, service)
 			}
 			params[k] = rawSecret.Value
 		}
@@ -80,6 +97,8 @@ func runExport(cmd *cobra.Command, args []string) error {
 		err = exportAsTsv(params, w)
 	case "dotenv":
 		err = exportAsEnvFile(params, w)
+	case "tfvars":
+		err = exportAsTfvars(params, w)
 	default:
 		err = errors.Errorf("Unsupported export format: %s", exportFormat)
 	}
@@ -98,7 +117,16 @@ func exportAsEnvFile(params map[string]string, w io.Writer) error {
 	for _, k := range sortedKeys(params) {
 		key := strings.ToUpper(k)
 		key = strings.Replace(key, "-", "_", -1)
-		w.Write([]byte(fmt.Sprintf("%s=%s\n", key, params[k])))
+		w.Write([]byte(fmt.Sprintf(`%s="%s"`+"\n", key, doubleQuoteEscape(params[k]))))
+	}
+	return nil
+}
+
+func exportAsTfvars(params map[string]string, w io.Writer) error {
+	// Terraform Variables is like dotenv, but removes the TF_VAR and keeps lowercase
+	for _, k := range sortedKeys(params) {
+		key := strings.TrimPrefix(k, "tf_var_")
+		w.Write([]byte(fmt.Sprintf(`%s = "%s"`+"\n", key, doubleQuoteEscape(params[k]))))
 	}
 	return nil
 }
@@ -161,4 +189,18 @@ func sortedKeys(params map[string]string) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+func doubleQuoteEscape(line string) string {
+	for _, c := range doubleQuoteSpecialChars {
+		toReplace := "\\" + string(c)
+		if c == '\n' {
+			toReplace = `\n`
+		}
+		if c == '\r' {
+			toReplace = `\r`
+		}
+		line = strings.Replace(line, string(c), toReplace, -1)
+	}
+	return line
 }

@@ -6,9 +6,13 @@ import (
 	"strings"
 
 	"github.com/pkg/errors"
-	"github.com/segmentio/chamber/store"
+	"github.com/segmentio/chamber/environ"
 	"github.com/spf13/cobra"
+	analytics "gopkg.in/segmentio/analytics-go.v3"
 )
+
+// When true, only use variables retrieved from the backend, do not inherit existing environment variables
+var pristine bool
 
 // execCmd represents the exec command
 var execCmd = &cobra.Command{
@@ -31,6 +35,7 @@ var execCmd = &cobra.Command{
 }
 
 func init() {
+	execCmd.Flags().BoolVar(&pristine, "pristine", false, "only use variables retrieved from the backend, do not inherit existing environment variables")
 	RootCmd.AddCommand(execCmd)
 }
 
@@ -38,57 +43,51 @@ func execRun(cmd *cobra.Command, args []string) error {
 	dashIx := cmd.ArgsLenAtDash()
 	services, command, commandArgs := args[:dashIx], args[dashIx], args[dashIx+1:]
 
-	env := environ(os.Environ())
-	secretStore := store.NewSSMStore(numRetries)
+	if analyticsEnabled && analyticsClient != nil {
+		analyticsClient.Enqueue(analytics.Track{
+			UserId: username,
+			Event:  "Ran Command",
+			Properties: analytics.NewProperties().
+				Set("command", "exec").
+				Set("chamber-version", chamberVersion).
+				Set("services", services).
+				Set("backend", backend),
+		})
+	}
+
+	env := environ.Environ{}
+	if !pristine {
+		env = environ.Environ(os.Environ())
+	}
+
+	secretStore, err := getSecretStore()
+	if err != nil {
+		return errors.Wrap(err, "Failed to get secret store")
+	}
 	for _, service := range services {
 		if err := validateService(service); err != nil {
 			return errors.Wrap(err, "Failed to validate service")
 		}
 
-		rawSecrets, err := secretStore.ListRaw(strings.ToLower(service))
+		collisions := make([]string, 0)
+		var err error
+		if _, noPaths := os.LookupEnv("CHAMBER_NO_PATHS"); noPaths {
+			err = env.LoadNoPaths(secretStore, service, &collisions)
+		} else {
+			err = env.Load(secretStore, service, &collisions)
+		}
 		if err != nil {
 			return errors.Wrap(err, "Failed to list store contents")
 		}
-		for _, rawSecret := range rawSecrets {
-			envVarKey := strings.ToUpper(key(rawSecret.Key))
-			envVarKey = strings.Replace(envVarKey, "-", "_", -1)
 
-			if env.IsSet(envVarKey) {
-				fmt.Fprintf(os.Stderr, "warning: overwriting environment variable %s\n", envVarKey)
-			}
-			env.Set(envVarKey, rawSecret.Value)
+		for _, c := range collisions {
+			fmt.Fprintf(os.Stderr, "warning: service %s overwriting environment variable %s\n", service, c)
 		}
+	}
+
+	if verbose {
+		fmt.Fprintf(os.Stdout, "info: With environment %s\n", strings.Join(env, ","))
 	}
 
 	return exec(command, commandArgs, env)
-}
-
-// environ is a slice of strings representing the environment, in the form "key=value".
-type environ []string
-
-// Unset an environment variable by key
-func (e *environ) Unset(key string) {
-	for i := range *e {
-		if strings.HasPrefix((*e)[i], key+"=") {
-			(*e)[i] = (*e)[len(*e)-1]
-			*e = (*e)[:len(*e)-1]
-			break
-		}
-	}
-}
-
-// IsSet returns whether or not a key is currently set in the environ
-func (e *environ) IsSet(key string) bool {
-	for i := range *e {
-		if strings.HasPrefix((*e)[i], key+"=") {
-			return true
-		}
-	}
-	return false
-}
-
-// Set adds an environment variable, replacing any existing ones of the same key
-func (e *environ) Set(key, val string) {
-	e.Unset(key)
-	*e = append(*e, key+"="+val)
 }

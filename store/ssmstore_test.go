@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/endpoints"
 	"github.com/aws/aws-sdk-go/service/ssm"
 	"github.com/aws/aws-sdk-go/service/ssm/ssmiface"
 	"github.com/stretchr/testify/assert"
@@ -33,19 +34,6 @@ func (m *mockSSMClient) PutParameter(i *ssm.PutParameterInput) (*ssm.PutParamete
 		}
 	}
 
-	if current.currentParam != nil {
-		history := &ssm.ParameterHistory{
-			Description:      current.meta.Description,
-			KeyId:            current.meta.KeyId,
-			LastModifiedDate: current.meta.LastModifiedDate,
-			LastModifiedUser: current.meta.LastModifiedUser,
-			Name:             current.meta.Name,
-			Type:             current.meta.Type,
-			Value:            current.currentParam.Value,
-		}
-		current.history = append(current.history, history)
-	}
-
 	current.currentParam = &ssm.Parameter{
 		Name:  i.Name,
 		Type:  i.Type,
@@ -59,6 +47,17 @@ func (m *mockSSMClient) PutParameter(i *ssm.PutParameterInput) (*ssm.PutParamete
 		Name:             i.Name,
 		Type:             i.Type,
 	}
+	history := &ssm.ParameterHistory{
+		Description:      current.meta.Description,
+		KeyId:            current.meta.KeyId,
+		LastModifiedDate: current.meta.LastModifiedDate,
+		LastModifiedUser: current.meta.LastModifiedUser,
+		Name:             current.meta.Name,
+		Type:             current.meta.Type,
+		Value:            current.currentParam.Value,
+	}
+	current.history = append(current.history, history)
+
 	m.parameters[*i.Name] = current
 
 	return &ssm.PutParameterOutput{}, nil
@@ -83,7 +82,7 @@ func (m *mockSSMClient) GetParameters(i *ssm.GetParametersInput) (*ssm.GetParame
 	if len(parameters) == 0 {
 		return &ssm.GetParametersOutput{
 			Parameters: parameters,
-		}, errors.New("parameters not found")
+		}, ErrSecretNotFound
 	}
 
 	return &ssm.GetParametersOutput{
@@ -173,8 +172,26 @@ func (m *mockSSMClient) GetParametersByPath(i *ssm.GetParametersByPathInput) (*s
 	}, nil
 }
 
+func (m *mockSSMClient) GetParametersByPathPages(i *ssm.GetParametersByPathInput, fn func(*ssm.GetParametersByPathOutput, bool) bool) error {
+	o, err := m.GetParametersByPath(i)
+	if err != nil {
+		return err
+	}
+	fn(o, true)
+	return nil
+}
+
 func (m *mockSSMClient) DescribeParametersPages(i *ssm.DescribeParametersInput, fn func(*ssm.DescribeParametersOutput, bool) bool) error {
 	o, err := m.DescribeParameters(i)
+	if err != nil {
+		return err
+	}
+	fn(o, true)
+	return nil
+}
+
+func (m *mockSSMClient) GetParameterHistoryPages(i *ssm.GetParameterHistoryInput, fn func(*ssm.GetParameterHistoryOutput, bool) bool) error {
+	o, err := m.GetParameterHistory(i)
 	if err != nil {
 		return err
 	}
@@ -288,7 +305,8 @@ func TestNewSSMStore(t *testing.T) {
 		os.Setenv("AWS_REGION", "us-west-1")
 		os.Setenv("AWS_DEFAULT_REGION", "us-west-2")
 
-		s := NewSSMStore(1)
+		s, err := NewSSMStore(1)
+		assert.Nil(t, err)
 		assert.Equal(t, "us-east-1", aws.StringValue(s.svc.(*ssm.SSM).Config.Region))
 		os.Unsetenv("CHAMBER_AWS_REGION")
 		os.Unsetenv("AWS_REGION")
@@ -298,10 +316,31 @@ func TestNewSSMStore(t *testing.T) {
 	t.Run("Should use AWS_REGION if it is set", func(t *testing.T) {
 		os.Setenv("AWS_REGION", "us-west-1")
 
-		s := NewSSMStore(1)
+		s, err := NewSSMStore(1)
+		assert.Nil(t, err)
 		assert.Equal(t, "us-west-1", aws.StringValue(s.svc.(*ssm.SSM).Config.Region))
 
 		os.Unsetenv("AWS_REGION")
+	})
+
+	t.Run("Should use CHAMBER_AWS_SSM_ENDPOINT if set", func(t *testing.T) {
+		os.Setenv("CHAMBER_AWS_SSM_ENDPOINT", "mycustomendpoint")
+
+		s, err := NewSSMStore(1)
+		assert.Nil(t, err)
+		endpoint, err := s.svc.(*ssm.SSM).Config.EndpointResolver.EndpointFor(endpoints.SsmServiceID, endpoints.UsWest2RegionID)
+		assert.Nil(t, err)
+		assert.Equal(t, "mycustomendpoint", endpoint.URL)
+
+		os.Unsetenv("CHAMBER_AWS_SSM_ENDPOINT")
+	})
+
+	t.Run("Should use default AWS SSM endpoint if CHAMBER_AWS_SSM_ENDPOINT not set", func(t *testing.T) {
+		s, err := NewSSMStore(1)
+		assert.Nil(t, err)
+		endpoint, err := s.svc.(*ssm.SSM).Config.EndpointResolver.EndpointFor(endpoints.SsmServiceID, endpoints.UsWest2RegionID)
+		assert.Nil(t, err)
+		assert.Equal(t, "https://ssm.us-west-2.amazonaws.com", endpoint.URL)
 	})
 
 }
@@ -317,6 +356,7 @@ func TestWrite(t *testing.T) {
 		assert.Contains(t, mock.parameters, store.idToName(secretId))
 		assert.Equal(t, "value", *mock.parameters[store.idToName(secretId)].currentParam.Value)
 		assert.Equal(t, "1", *mock.parameters[store.idToName(secretId)].meta.Description)
+		assert.Equal(t, 1, len(mock.parameters[store.idToName(secretId)].history))
 	})
 
 	t.Run("Setting a key twice should create a new version", func(t *testing.T) {
@@ -329,7 +369,7 @@ func TestWrite(t *testing.T) {
 		assert.Contains(t, mock.parameters, store.idToName(secretId))
 		assert.Equal(t, "newvalue", *mock.parameters[store.idToName(secretId)].currentParam.Value)
 		assert.Equal(t, "2", *mock.parameters[store.idToName(secretId)].meta.Description)
-		assert.Equal(t, 1, len(mock.parameters[store.idToName(secretId)].history))
+		assert.Equal(t, 2, len(mock.parameters[store.idToName(secretId)].history))
 	})
 }
 
@@ -553,6 +593,7 @@ func TestWritePaths(t *testing.T) {
 		assert.Contains(t, mock.parameters, store.idToName(secretId))
 		assert.Equal(t, "value", *mock.parameters[store.idToName(secretId)].currentParam.Value)
 		assert.Equal(t, "1", *mock.parameters[store.idToName(secretId)].meta.Description)
+		assert.Equal(t, 1, len(mock.parameters[store.idToName(secretId)].history))
 	})
 
 	t.Run("Setting a key twice should create a new version", func(t *testing.T) {
@@ -565,7 +606,7 @@ func TestWritePaths(t *testing.T) {
 		assert.Contains(t, mock.parameters, store.idToName(secretId))
 		assert.Equal(t, "newvalue", *mock.parameters[store.idToName(secretId)].currentParam.Value)
 		assert.Equal(t, "2", *mock.parameters[store.idToName(secretId)].meta.Description)
-		assert.Equal(t, 1, len(mock.parameters[store.idToName(secretId)].history))
+		assert.Equal(t, 2, len(mock.parameters[store.idToName(secretId)].history))
 	})
 }
 
@@ -713,6 +754,83 @@ func TestDelete(t *testing.T) {
 		err := store.Delete(SecretId{Service: "test", Key: "nonkey"})
 		assert.Equal(t, ErrSecretNotFound, err)
 	})
+}
+
+func TestValidations(t *testing.T) {
+	mock := &mockSSMClient{parameters: map[string]mockParameter{}}
+	pathStore := NewTestSSMStore(mock)
+	pathStore.usePaths = true
+
+	validPathFormat := []string{
+		"/foo",
+		"/foo.",
+		"/.foo",
+		"/foo.bar",
+		"/foo-bar",
+		"/foo/bar",
+		"/foo.bar/foo",
+		"/foo-bar/foo",
+		"/foo-bar/foo-bar",
+		"/foo/bar/foo",
+		"/foo/bar/foo-bar",
+	}
+
+	for _, k := range validPathFormat {
+		t.Run("Path Validation should return true", func(t *testing.T) {
+			result := pathStore.validateName(k)
+			assert.True(t, result)
+		})
+	}
+
+	invalidPathFormat := []string{
+		"/foo//bar",
+		"foo//bar",
+		"foo/bar",
+		"foo/b",
+		"foo",
+	}
+
+	for _, k := range invalidPathFormat {
+		t.Run("Path Validation should return false", func(t *testing.T) {
+			result := pathStore.validateName(k)
+			assert.False(t, result)
+		})
+	}
+
+	noPathStore := NewTestSSMStore(mock)
+	noPathStore.usePaths = false
+
+	validNoPathFormat := []string{
+		"foo",
+		"foo.",
+		".foo",
+		"foo.bar",
+		"foo-bar",
+		"foo-bar.foo",
+		"foo-bar.foo-bar",
+		"foo.bar.foo",
+		"foo.bar.foo-bar",
+	}
+
+	for _, k := range validNoPathFormat {
+		t.Run("Validation should return true", func(t *testing.T) {
+			result := noPathStore.validateName(k)
+			assert.True(t, result)
+		})
+	}
+
+	invalidNoPathFormat := []string{
+		"/foo",
+		"foo/bar",
+		"foo//bar",
+	}
+
+	for _, k := range invalidNoPathFormat {
+		t.Run("Validation should return false", func(t *testing.T) {
+			result := noPathStore.validateName(k)
+			assert.False(t, result)
+		})
+	}
 }
 
 type ByKey []Secret

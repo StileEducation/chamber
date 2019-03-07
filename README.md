@@ -5,6 +5,28 @@ secrets in SSM Parameter Store, an AWS service for storing secrets.
 
 For detailed info about using chamber, read [The Right Way To Manage Secrets](https://aws.amazon.com/blogs/mt/the-right-way-to-store-secrets-using-parameter-store/)
 
+## 2.0 Breaking Changes
+
+Starting with version 2.0, chamber uses parameter store's path based API by default.  Chamber pre-2.0 supported this API using the `CHAMBER_USE_PATHS` environment variable.  The paths based API has performance benefits and is the recommended best practice by AWS.
+
+As a side effect of this change, if you didn't use path based secrets before 2.0, you will need to set `CHAMBER_NO_PATHS` to enable the old behavior.  This option is deprecated, and We recommend only using this setting for supporting existing applications.
+
+To migrate to the new format, you can take advantage of the `export` and `import` commands.  For example, if you wanted to convert secrets for service `foo` to the new format using chamber 2.0, you can do:
+
+```bash
+$ CHAMBER_NO_PATHS=1 chamber export foo | chamber import foo -
+```
+
+## Installing
+
+If you have a functional go environment, you can install with:
+
+```bash
+$ go get github.com/segmentio/chamber
+```
+
+[See the wiki for more installation options like Docker images, Linux packages, and precompiled binaries.](https://github.com/segmentio/chamber/wiki/Installation)
+
 ## Authenticating
 
 Using `chamber` requires you to be running in an environment with an
@@ -48,7 +70,8 @@ resource "aws_kms_alias" "parameter_store_alias" {
 ```
 
 If you'd like to use an alternate KMS key to encrypt your secrets, you can set
-the environment variable `CHAMBER_KMS_KEY_ALIAS`.
+the environment variable `CHAMBER_KMS_KEY_ALIAS`. As an example, the following will use your account's default SSM alias:
+`CHAMBER_KMS_KEY_ALIAS=aws/ssm`
 
 ## Usage
 
@@ -131,10 +154,10 @@ version (-1) is the latest secret.
 ### Exporting
 ```bash
 $ chamber export [--format <format>] [--output-file <file>]  <service...>
-{"key","secret"}
+{"key":"secret"}
 ```
 
-`export` providers ability to export secrets in various file formats. The following
+`export` provides ability to export secrets in various file formats. The following
 file formats are supported:
 
 * json (default)
@@ -145,6 +168,16 @@ file formats are supported:
 
 File is written to standard output by default but you may specify an output
 file.
+
+### Importing
+```bash
+$ chamber import <service> <filepath>
+```
+
+`import` provides the ability to import secrets from a json file (like the kind
+you get from `chamber export`).
+
+You can set `filepath` to `-` to instead read input from stdin.
 
 ### Deleting
 ```bash
@@ -174,11 +207,28 @@ for more details.
 
 If you'd like to use a different region for chamber without changing `AWS_REGION`, you can use `CHAMBER_AWS_REGION` to override just for chamber.
 
-### Using Path Based Keys
+### Custom SSM Endpoint
 
-If you'd prefer to use path based keys (`/service/key`) instead of the default period separated keys (`service.key`), you
-can set the environment variable `CHAMBER_USE_PATHS` to 1.  This environment variable must be set when writing and reading keys.
+If you'd like to use a custom SSM endpoint for chamber, you can use `CHAMBER_AWS_SSM_ENDPOINT` to override AWS default URL.
 
+## S3 Backend (experimental)
+
+By default, chamber store secrets in AWS Parameter Store.  We now also provide an experimental S3 backend for storing secrets in S3 instead.
+
+To configure chamber to use the S3 backend, use `chamber -b s3 --backend-s3-bucket=mybucket`.  Preferably, this bucket should reject uploads that do not set the server side encryption header ([see this doc for details how](https://aws.amazon.com/blogs/security/how-to-prevent-uploads-of-unencrypted-objects-to-amazon-s3/))
+
+This feature is experimental, and not currently meant for production work.
+
+## Null Backend (experimental)
+
+If it's preferred to not use any backend at all, use `chamber -b null`. Doing so will forward existing ENV variables as if Chamber is not in between.
+
+This feature is experimental, and not currently meant for production work.
+
+
+## Analytics
+
+`chamber` includes some usage analytics code which Segment uses internally for tracking usage of internal tools.  This analytics code is turned off by default, and can only be enabled via a linker flag at build time, which we do not set for public github releases.
 
 ## Releasing
 
