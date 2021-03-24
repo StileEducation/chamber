@@ -121,6 +121,8 @@ func (s *S3KMSStore) Write(id SecretId, value string) error {
 		return err
 	}
 
+    fmt.Printf("KMS Key Alias rhubarb: %s", s.kmsKeyAlias)
+
 	putObjectInput := &s3.PutObjectInput{
 		Bucket:               aws.String(s.bucket),
 		ServerSideEncryption: aws.String(s3.ServerSideEncryptionAwsKms),
